@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>智慧 PDF/OCR 簡報編輯器 (Clean Mode)</title>
+    <title>智慧 PDF/OCR 簡報編輯器 (Inpainting Mode)</title>
     
     <!-- React & ReactDOM -->
     <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
@@ -35,7 +35,6 @@
         .slide-preview:hover { border-color: #3b82f6; }
         .slide-preview.active { border-color: #2563eb; ring: 2px solid #2563eb; }
         
-        /* 編輯區陰影與背景 */
         .editor-canvas {
             box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
             background-color: white;
@@ -43,11 +42,10 @@
             overflow: hidden;
         }
 
-        /* 可編輯文字框樣式 */
         .editable-box {
             position: absolute;
             outline: none;
-            overflow: hidden; /* 直書時可能需要 visible，但為了不破版先 hidden */
+            overflow: hidden;
             white-space: pre-wrap;
             z-index: 10;
             padding: 2px;
@@ -69,13 +67,11 @@
             box-shadow: 0 4px 6px rgba(0,0,0,0.1);
         }
 
-        /* 直書支援 */
         .editable-box.vertical {
             writing-mode: vertical-rl;
             text-orientation: upright;
         }
         
-        /* 屬性面板 */
         .property-panel {
             position: fixed;
             right: 20px;
@@ -112,56 +108,78 @@
 
         const SCOPES = 'https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/presentations https://www.googleapis.com/auth/cloud-vision';
 
-        // --- 圖像處理工具: 計算區域周圍的平均顏色 (智慧去背用) ---
-        const getDominantColor = (ctx, x, y, w, h) => {
+        // --- 進階演算法: 雙線性插值修復 (Inpainting) ---
+        // 這是模擬「浮水印去除」的關鍵函式
+        const smartInpaint = (ctx, x, y, w, h) => {
             try {
-                // 取樣邊框周圍的像素 (上、下、左、右各取樣一條線)
-                // 為了效能，我們簡化為取樣四周擴大 2px 的範圍
+                // 向外擴展 2px 取樣背景
                 const margin = 2;
-                const sx = Math.max(0, x - margin);
-                const sy = Math.max(0, y - margin);
-                const sw = w + margin * 2;
-                const sh = h + margin * 2;
-                
+                const sx = Math.max(0, Math.floor(x - margin));
+                const sy = Math.max(0, Math.floor(y - margin));
+                const sw = Math.ceil(w + margin * 2);
+                const sh = Math.ceil(h + margin * 2);
+
+                // 取得該區域的像素資料
                 const imgData = ctx.getImageData(sx, sy, sw, sh);
                 const data = imgData.data;
-                const colorCounts = {};
-                let maxCount = 0;
-                let dominant = 'rgb(255,255,255)';
+                const width = sw;
+                const height = sh;
 
-                // 簡單統計 (每 4 個 bytes 為一組 RGBA)
-                // 我們只統計邊緣，忽略中間 (因為中間是文字)
-                for (let i = 0; i < data.length; i += 4 * 4) { // 跳躍取樣加速
-                    const r = data[i];
-                    const g = data[i+1];
-                    const b = data[i+2];
-                    const a = data[i+3];
-                    
-                    // 忽略透明
-                    if (a < 50) continue;
+                // 針對區域內的每一個像素進行修補
+                for (let j = 0; j < height; j++) {
+                    for (let i = 0; i < width; i++) {
+                        // 只處理「內部」的像素 (即原本文字所在的位置)
+                        // 邊緣像素保持原樣，作為取樣來源
+                        if (i > margin && i < width - margin && j > margin && j < height - margin) {
+                            
+                            const index = (j * width + i) * 4;
+                            
+                            // 取得上下左右四個邊界對應點的像素索引
+                            const topIdx = (0 * width + i) * 4;
+                            const bottomIdx = ((height - 1) * width + i) * 4;
+                            const leftIdx = (j * width + 0) * 4;
+                            const rightIdx = (j * width + (width - 1)) * 4;
 
-                    // 簡單量化顏色以增加命中率 (每 10 為一階)
-                    const key = `${Math.round(r/10)*10},${Math.round(g/10)*10},${Math.round(b/10)*10}`;
-                    colorCounts[key] = (colorCounts[key] || 0) + 1;
-                    
-                    if (colorCounts[key] > maxCount) {
-                        maxCount = colorCounts[key];
-                        dominant = `rgb(${r},${g},${b})`;
+                            // 計算權重 (線性插值)
+                            const yRatio = j / height;
+                            const xRatio = i / width;
+
+                            // R 通道混合
+                            const rH = data[topIdx] * (1 - yRatio) + data[bottomIdx] * yRatio; // 垂直方向的漸層預測
+                            const rV = data[leftIdx] * (1 - xRatio) + data[rightIdx] * xRatio; // 水平方向的漸層預測
+                            data[index] = (rH + rV) / 2; // 取平均
+
+                            // G 通道混合
+                            const gH = data[topIdx+1] * (1 - yRatio) + data[bottomIdx+1] * yRatio;
+                            const gV = data[leftIdx+1] * (1 - xRatio) + data[rightIdx+1] * xRatio;
+                            data[index+1] = (gH + gV) / 2;
+
+                            // B 通道混合
+                            const bH = data[topIdx+2] * (1 - yRatio) + data[bottomIdx+2] * yRatio;
+                            const bV = data[leftIdx+2] * (1 - xRatio) + data[rightIdx+2] * xRatio;
+                            data[index+2] = (bH + bV) / 2;
+
+                            // Alpha 通道 (不透明)
+                            data[index+3] = 255; 
+                        }
                     }
                 }
-                return dominant;
+                
+                // 將修復後的像素放回畫布
+                ctx.putImageData(imgData, sx, sy);
             } catch (e) {
-                return '#ffffff';
+                console.error("Inpainting failed", e);
+                // Fallback: 簡單填白
+                ctx.fillStyle = '#ffffff';
+                ctx.fillRect(x, y, w, h);
             }
         };
 
-        // --- 可編輯文字方塊元件 ---
         const EditableBlock = React.memo(({ el, isSelected, onUpdate, onSelect }) => {
             const contentRef = useRef(null);
 
             useEffect(() => {
                 if (contentRef.current && contentRef.current.innerText !== el.text) {
-                    // 只有當此元件沒有焦點時，才從外部強制更新 (避免打字時游標跳動)
                     if (document.activeElement !== contentRef.current) {
                         contentRef.current.innerText = el.text;
                     }
@@ -192,7 +210,7 @@
                         fontSize: `${el.fontSize}px`,
                         color: el.color,
                         fontFamily: el.fontFamily,
-                        backgroundColor: el.backgroundColor || 'transparent', // 如果底圖已去背，文字框可透明
+                        backgroundColor: el.backgroundColor || 'transparent', 
                         textAlign: 'left'
                     }}
                     onInput={handleInput}
@@ -204,31 +222,23 @@
         });
 
         function App() {
-            // Config & Auth
             const [config, setConfig] = useState({ clientId: '', apiKey: '' });
             const [rememberConfig, setRememberConfig] = useState(true);
             const [isConfigured, setIsConfigured] = useState(false);
             const [tokenClient, setTokenClient] = useState(null);
             const [accessToken, setAccessToken] = useState(null);
             const [userProfile, setUserProfile] = useState(null);
-
-            // Environment
             const [envError, setEnvError] = useState(null);
             const [currentOrigin, setCurrentOrigin] = useState('');
             const [isGithub, setIsGithub] = useState(false);
-
-            // Editor
             const [slides, setSlides] = useState([]);
             const [currentSlideIndex, setCurrentSlideIndex] = useState(0);
             const [scale, setScale] = useState(0.5);
             const [isProcessing, setIsProcessing] = useState(false);
             const [statusMsg, setStatusMsg] = useState('');
-            
-            // Selection
             const [selectedElementId, setSelectedElementId] = useState(null);
             const canvasContainerRef = useRef(null);
 
-            // --- Initialization ---
             useEffect(() => {
                 const protocol = window.location.protocol;
                 const origin = window.location.origin;
@@ -306,7 +316,6 @@
                 }
             };
 
-            // --- File Upload ---
             const handleFileUpload = async (e) => {
                 const files = Array.from(e.target.files);
                 if (!files.length) return;
@@ -336,7 +345,6 @@
                 setIsProcessing(false);
             };
 
-            // --- Advanced OCR & Text Removal ---
             const runOCR = async () => {
                 if (!slides.length || !accessToken) return alert("請先登入並上傳檔案");
                 const slide = slides[currentSlideIndex];
@@ -346,7 +354,6 @@
                 setStatusMsg('OCR 分析中...');
                 
                 try {
-                    // 1. Call Vision API
                     const res = await fetch(`https://vision.googleapis.com/v1/images:annotate`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${accessToken}` },
@@ -355,13 +362,10 @@
                     const result = await res.json();
                     if (result.error) throw result.error;
 
-                    // 2. Prepare Canvas for Image Manipulation (Removing text)
                     const tempCanvas = document.createElement('canvas');
                     tempCanvas.width = slide.width;
                     tempCanvas.height = slide.height;
                     const ctx = tempCanvas.getContext('2d');
-                    
-                    // Load current image to canvas
                     const img = new Image();
                     await new Promise(r => { img.onload = r; img.src = slide.image; });
                     ctx.drawImage(img, 0, 0);
@@ -370,7 +374,7 @@
                     const annotation = result.responses?.[0]?.fullTextAnnotation;
                     
                     if (annotation) {
-                        setStatusMsg('正在智慧去除原圖文字...');
+                        setStatusMsg('正在執行浮水印去除與文字填補...');
                         
                         annotation.pages[0].blocks.forEach(block => {
                             block.paragraphs.forEach(para => {
@@ -383,26 +387,21 @@
                                 const h = (vertices[2].y || y) - y;
 
                                 if (w > 0 && h > 0) {
-                                    // A. 智慧取色 (Smart Background Sampling)
-                                    const bgColor = getDominantColor(ctx, x, y, w, h);
-                                    
-                                    // B. 去除原圖文字 (Erasure by filling with background color)
-                                    ctx.fillStyle = bgColor;
-                                    ctx.fillRect(x - 1, y - 1, w + 2, h + 2); // 稍微擴大一點覆蓋範圍
+                                    // 1. 執行 Inpainting (浮水印去除)
+                                    // 這會直接修改底圖，把文字「擦掉」
+                                    smartInpaint(ctx, x, y, w, h);
 
-                                    // C. 判斷直書 (Vertical Text Detection)
-                                    // 簡單規則：如果高度 > 寬度 * 1.5 且包含非 ASCII 字元(可能是中文)，假定為直書
                                     const isVertical = (h > w * 1.5) && /[^\x00-\x7F]/.test(text);
 
                                     newElements.push({
                                         id: crypto.randomUUID(),
                                         text: text,
                                         x: x, y: y, width: w, height: h,
-                                        // 字體大小微調
                                         fontSize: Math.round(isVertical ? w * 0.7 : h * 0.8),
                                         color: '#000000',
                                         fontFamily: 'Noto Sans TC',
-                                        backgroundColor: bgColor, // 雖然底圖已去背，但為了無縫融合，這裡也設定同色背景
+                                        // 2. 文字框背景設為透明 (因為底圖已經擦乾淨了)
+                                        backgroundColor: 'transparent',
                                         isVertical: isVertical
                                     });
                                 }
@@ -410,9 +409,9 @@
                         });
                     }
                     
-                    // 3. Update Slide with "Cleaned" Image and New Elements
                     const updated = [...slides];
-                    updated[currentSlideIndex].image = tempCanvas.toDataURL('image/jpeg', 0.9); // 更新為無字天書版底圖
+                    // 更新為「去背後」的圖片
+                    updated[currentSlideIndex].image = tempCanvas.toDataURL('image/jpeg', 0.9);
                     updated[currentSlideIndex].elements = newElements;
                     setSlides(updated);
 
@@ -420,7 +419,6 @@
                 setIsProcessing(false); setStatusMsg('');
             };
 
-            // --- Updates & Export ---
             const updateElement = useCallback((id, changes) => {
                 setSlides(prev => {
                     const newSlides = [...prev];
@@ -456,7 +454,6 @@
                         const pageId = `slide_${i}_${Date.now()}`;
                         requests.push({ createSlide: { objectId: pageId, slideLayoutReference: { predefinedLayout: 'BLANK' } } });
                         
-                        // Upload Cleaned BG
                         const boundary = '-------314159265358979323846';
                         const body = `\r\n--${boundary}\r\nContent-Type: application/json\r\n\r\n${JSON.stringify({name: 'bg.jpg', parents:['root']})}\r\n--${boundary}\r\nContent-Type: image/jpeg\r\nContent-Transfer-Encoding: base64\r\n\r\n${s.image.split(',')[1]}\r\n--${boundary}--`;
                         const upRes = await gapi.client.request({ path: '/upload/drive/v3/files?uploadType=multipart', method: 'POST', headers: { 'Content-Type': `multipart/related; boundary="${boundary}"` }, body: body });
@@ -465,12 +462,9 @@
 
                         requests.push({ updatePageProperties: { objectId: pageId, pageProperties: { pageBackgroundFill: { stretchedPictureFill: { contentUrl: `https://drive.google.com/uc?export=download&id=${fileId}` } } }, fields: 'pageBackgroundFill' } });
 
-                        // Add Text
                         const pxToPt = 0.75;
                         s.elements.forEach(el => {
                             const id = `txt_${el.id}`;
-                            // 直書/橫書的 transform 稍微不同，但 Google Slides API 目前主要靠 Shape 內的文字設定
-                            // 這裡我們主要設定位置和大小
                             requests.push({ 
                                 createShape: { 
                                     objectId: id, 
@@ -484,14 +478,11 @@
                             });
                             requests.push({ insertText: { objectId: id, text: el.text } });
                             
-                            // Color Convert
                             const hex = el.color;
                             const r = parseInt(hex.slice(1,3),16)/255;
                             const g = parseInt(hex.slice(3,5),16)/255;
                             const b = parseInt(hex.slice(5,7),16)/255;
 
-                            // 如果是直書，這裡暫時沒有簡單的 API 可以直接設 writingMode，
-                            // 但我們可以先確保字型和顏色正確。Google Slides API 的 writingMode 設定較複雜。
                             requests.push({ 
                                 updateTextStyle: { 
                                     objectId: id, 
@@ -556,7 +547,6 @@
                     </div>
 
                     <div className="flex flex-1 overflow-hidden relative">
-                        {/* 左側縮圖 */}
                         <div className="w-48 bg-gray-50 border-r flex-shrink-0 overflow-y-auto p-2 flex flex-col gap-2 z-10">
                             {slides.map((s, idx) => (
                                 <div key={s.id} onClick={() => setCurrentSlideIndex(idx)} className={`slide-preview cursor-pointer bg-white border-2 rounded p-1 ${currentSlideIndex === idx ? 'active' : 'border-transparent'}`}>
@@ -566,7 +556,6 @@
                             ))}
                         </div>
 
-                        {/* 主編輯區 */}
                         <div className="flex-1 bg-gray-200 overflow-auto flex justify-center p-10" ref={canvasContainerRef}>
                             {currentSlide ? (
                                 <div style={{ width: currentSlide.width * scale, height: currentSlide.height * scale, flexShrink: 0 }}>
@@ -586,7 +575,6 @@
                             ) : <div className="m-auto text-gray-400 text-center"><i className="fas fa-image text-4xl mb-2"></i><br/>請上傳文件</div>}
                         </div>
 
-                        {/* 懸浮屬性面板 */}
                         {selectedElementId && (
                             <div className="property-panel p-4 flex flex-col gap-3" onMouseDown={e => e.stopPropagation()}>
                                 <div className="flex justify-between items-center border-b pb-2 mb-1">
