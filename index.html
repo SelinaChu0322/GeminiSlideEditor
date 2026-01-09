@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>智慧 PDF/OCR 簡報編輯器</title>
+    <title>智慧 PDF/OCR 簡報編輯器 (Clean Mode)</title>
     
     <!-- React & ReactDOM -->
     <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
@@ -29,7 +29,7 @@
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 
     <style>
-        body { font-family: 'Noto Sans TC', sans-serif; background-color: #e5e7eb; } /* 背景深一點讓畫布更明顯 */
+        body { font-family: 'Noto Sans TC', sans-serif; background-color: #e5e7eb; user-select: none; }
         
         .slide-preview { transition: all 0.2s; }
         .slide-preview:hover { border-color: #3b82f6; }
@@ -41,37 +41,58 @@
             background-color: white;
             position: relative;
             overflow: hidden;
-            /* Transform logic moved to inline styles for better control */
         }
 
-        /* 可編輯文字框樣式 - Canva 風格 */
+        /* 可編輯文字框樣式 */
         .editable-box {
             position: absolute;
-            background-color: #ffffff; /* 必須覆蓋原圖 */
             outline: none;
-            overflow: hidden;
+            overflow: hidden; /* 直書時可能需要 visible，但為了不破版先 hidden */
             white-space: pre-wrap;
             z-index: 10;
-            padding: 0px; /* 移除 padding 讓它更貼合 */
+            padding: 2px;
             line-height: 1.2;
             cursor: text;
-            /* 預設無邊框，只有 hover/focus 才顯示 */
             border: 1px solid transparent; 
+            box-sizing: border-box;
+            transition: border-color 0.1s;
         }
         
         .editable-box:hover {
-            border: 1px solid #3b82f6; /* 藍色細框提示這是可編輯的 */
+            border: 1px solid #3b82f6;
             z-index: 15;
         }
         
-        .editable-box:focus {
-            border: 2px solid #2563eb; /* 編輯中狀態 */
+        .editable-box.selected {
+            border: 2px solid #2563eb; 
             z-index: 20;
-            background-color: white;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+
+        /* 直書支援 */
+        .editable-box.vertical {
+            writing-mode: vertical-rl;
+            text-orientation: upright;
         }
         
-        /* Loading Spinner */
+        /* 屬性面板 */
+        .property-panel {
+            position: fixed;
+            right: 20px;
+            top: 80px;
+            width: 260px;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1);
+            z-index: 50;
+            animation: slideIn 0.2s ease-out;
+        }
+
+        @keyframes slideIn {
+            from { opacity: 0; transform: translateX(20px); }
+            to { opacity: 1; transform: translateX(0); }
+        }
+        
         .loader {
             border: 4px solid #f3f3f3;
             border-top: 4px solid #3498db;
@@ -87,13 +108,103 @@
     <div id="root"></div>
 
     <script type="text/babel">
-        const { useState, useEffect, useRef } = React;
+        const { useState, useEffect, useRef, useCallback } = React;
 
-        // SCOPES needed for Drive, Slides, and Cloud Vision
         const SCOPES = 'https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/presentations https://www.googleapis.com/auth/cloud-vision';
 
+        // --- 圖像處理工具: 計算區域周圍的平均顏色 (智慧去背用) ---
+        const getDominantColor = (ctx, x, y, w, h) => {
+            try {
+                // 取樣邊框周圍的像素 (上、下、左、右各取樣一條線)
+                // 為了效能，我們簡化為取樣四周擴大 2px 的範圍
+                const margin = 2;
+                const sx = Math.max(0, x - margin);
+                const sy = Math.max(0, y - margin);
+                const sw = w + margin * 2;
+                const sh = h + margin * 2;
+                
+                const imgData = ctx.getImageData(sx, sy, sw, sh);
+                const data = imgData.data;
+                const colorCounts = {};
+                let maxCount = 0;
+                let dominant = 'rgb(255,255,255)';
+
+                // 簡單統計 (每 4 個 bytes 為一組 RGBA)
+                // 我們只統計邊緣，忽略中間 (因為中間是文字)
+                for (let i = 0; i < data.length; i += 4 * 4) { // 跳躍取樣加速
+                    const r = data[i];
+                    const g = data[i+1];
+                    const b = data[i+2];
+                    const a = data[i+3];
+                    
+                    // 忽略透明
+                    if (a < 50) continue;
+
+                    // 簡單量化顏色以增加命中率 (每 10 為一階)
+                    const key = `${Math.round(r/10)*10},${Math.round(g/10)*10},${Math.round(b/10)*10}`;
+                    colorCounts[key] = (colorCounts[key] || 0) + 1;
+                    
+                    if (colorCounts[key] > maxCount) {
+                        maxCount = colorCounts[key];
+                        dominant = `rgb(${r},${g},${b})`;
+                    }
+                }
+                return dominant;
+            } catch (e) {
+                return '#ffffff';
+            }
+        };
+
+        // --- 可編輯文字方塊元件 ---
+        const EditableBlock = React.memo(({ el, isSelected, onUpdate, onSelect }) => {
+            const contentRef = useRef(null);
+
+            useEffect(() => {
+                if (contentRef.current && contentRef.current.innerText !== el.text) {
+                    // 只有當此元件沒有焦點時，才從外部強制更新 (避免打字時游標跳動)
+                    if (document.activeElement !== contentRef.current) {
+                        contentRef.current.innerText = el.text;
+                    }
+                }
+            }, [el.text]);
+
+            const handleInput = (e) => {
+                const newText = e.target.innerText;
+                onUpdate(el.id, { text: newText });
+            };
+
+            const handleMouseDown = (e) => {
+                e.stopPropagation(); 
+                onSelect(el.id);
+            };
+
+            return (
+                <div
+                    ref={contentRef}
+                    className={`editable-box ${isSelected ? 'selected' : ''} ${el.isVertical ? 'vertical' : ''}`}
+                    contentEditable
+                    suppressContentEditableWarning
+                    style={{
+                        left: `${el.x}px`,
+                        top: `${el.y}px`,
+                        width: `${el.width}px`,
+                        height: `${el.height}px`,
+                        fontSize: `${el.fontSize}px`,
+                        color: el.color,
+                        fontFamily: el.fontFamily,
+                        backgroundColor: el.backgroundColor || 'transparent', // 如果底圖已去背，文字框可透明
+                        textAlign: 'left'
+                    }}
+                    onInput={handleInput}
+                    onMouseDown={handleMouseDown}
+                >
+                    {el.text}
+                </div>
+            );
+        });
+
         function App() {
-            // State: Configuration & Auth
+            // Config & Auth
             const [config, setConfig] = useState({ clientId: '', apiKey: '' });
             const [rememberConfig, setRememberConfig] = useState(true);
             const [isConfigured, setIsConfigured] = useState(false);
@@ -101,44 +212,30 @@
             const [accessToken, setAccessToken] = useState(null);
             const [userProfile, setUserProfile] = useState(null);
 
-            // State: Environment Check
+            // Environment
             const [envError, setEnvError] = useState(null);
             const [currentOrigin, setCurrentOrigin] = useState('');
             const [isGithub, setIsGithub] = useState(false);
 
-            // State: Editor
+            // Editor
             const [slides, setSlides] = useState([]);
             const [currentSlideIndex, setCurrentSlideIndex] = useState(0);
-            
-            // Layout: Default scale set to 50%
             const [scale, setScale] = useState(0.5);
-            
             const [isProcessing, setIsProcessing] = useState(false);
             const [statusMsg, setStatusMsg] = useState('');
             
-            // State: Text Styling
+            // Selection
             const [selectedElementId, setSelectedElementId] = useState(null);
-            
             const canvasContainerRef = useRef(null);
 
             // --- Initialization ---
-
             useEffect(() => {
-                // 1. Environment Check
                 const protocol = window.location.protocol;
                 const origin = window.location.origin;
                 setCurrentOrigin(origin);
+                if (protocol === 'file:') setEnvError('file_protocol');
+                if (window.location.hostname.endsWith('github.io')) setIsGithub(true);
 
-                if (protocol === 'file:') {
-                    setEnvError('file_protocol');
-                }
-                
-                // GitHub Pages Check
-                if (window.location.hostname.endsWith('github.io')) {
-                    setIsGithub(true);
-                }
-
-                // 2. Load Config
                 const savedConfig = localStorage.getItem('slide_ocr_config');
                 if (savedConfig) {
                     try {
@@ -148,784 +245,390 @@
                             setIsConfigured(true);
                             initializeGoogle(parsed.clientId, parsed.apiKey);
                         }
-                    } catch (e) {
-                        console.error("Failed to parse config", e);
-                    }
+                    } catch (e) { console.error(e); }
                 }
+
+                const handleGlobalClick = (e) => {
+                    if (e.target.closest('.editable-box') || e.target.closest('.property-panel')) return;
+                    setSelectedElementId(null);
+                };
+                window.addEventListener('mousedown', handleGlobalClick);
+                return () => window.removeEventListener('mousedown', handleGlobalClick);
             }, []);
 
             const initializeGoogle = (clientId, apiKey) => {
-                let client = null;
-                // Check if running in a valid environment before init
                 if (window.location.protocol === 'file:') return null;
-
                 if (window.google && window.google.accounts) {
-                    client = google.accounts.oauth2.initTokenClient({
-                        client_id: clientId,
-                        scope: SCOPES,
+                    const client = google.accounts.oauth2.initTokenClient({
+                        client_id: clientId, scope: SCOPES,
                         callback: (tokenResponse) => {
                             if (tokenResponse.access_token) {
                                 setAccessToken(tokenResponse.access_token);
                                 fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
                                     headers: { Authorization: `Bearer ${tokenResponse.access_token}` }
-                                })
-                                .then(res => res.json())
-                                .then(data => setUserProfile(data));
+                                }).then(res => res.json()).then(data => setUserProfile(data));
                             }
                         },
-                        error_callback: (error) => {
-                           console.error("Login Error Details:", error);
-                           
-                           let errorMsg = "登入發生錯誤。\n";
-                           if (error.type === 'popup_closed') {
-                               errorMsg = "登入視窗被關閉。";
-                           } else if (error.message && error.message.includes('access_denied')) {
-                               errorMsg = `【存取被拒 (403)】\nGoogle 拒絕了來自此網址的連線。\n\n請務必確認您已將網址加入 GCP Console：\n${window.location.origin}\n\n(設定後需等待約 5 分鐘生效)`;
-                           } else {
-                               errorMsg += (error.message || JSON.stringify(error));
-                           }
-                           
-                           alert(errorMsg);
-                        }
+                        error_callback: (err) => alert("登入錯誤: " + JSON.stringify(err))
                     });
                     setTokenClient(client);
                 }
-
                 if (window.gapi) {
                     gapi.load('client', () => {
-                        gapi.client.init({
-                            apiKey: apiKey || undefined,
-                            discoveryDocs: [
-                                'https://slides.googleapis.com/$discovery/rest?version=v1',
-                                'https://www.googleapis.com/discovery/v1/apis/drive/v3/rest'
-                            ],
-                        });
+                        gapi.client.init({ apiKey: apiKey || undefined, discoveryDocs: ['https://slides.googleapis.com/$discovery/rest?version=v1', 'https://www.googleapis.com/discovery/v1/apis/drive/v3/rest'] });
                     });
                 }
-                return client;
             };
 
             const handleConfigSubmit = (e) => {
                 e.preventDefault();
                 if (envError) return;
-
                 if (config.clientId) {
-                    if (rememberConfig) {
-                        localStorage.setItem('slide_ocr_config', JSON.stringify(config));
-                    } else {
-                        localStorage.removeItem('slide_ocr_config');
-                    }
-                    
+                    if (rememberConfig) localStorage.setItem('slide_ocr_config', JSON.stringify(config));
+                    else localStorage.removeItem('slide_ocr_config');
                     setIsConfigured(true);
-                    
-                    const client = initializeGoogle(config.clientId, config.apiKey);
-                    if (client) {
-                        client.requestAccessToken();
-                    } else {
-                        setStatusMsg("正在初始化 Google 元件...");
-                        setTimeout(() => {
-                            initializeGoogle(config.clientId, config.apiKey);
-                            setStatusMsg("");
-                        }, 1500);
-                    }
+                    setTimeout(() => initializeGoogle(config.clientId, config.apiKey), 500);
                 }
             };
 
             const clearConfig = () => {
-                if (window.confirm("確定要清除 Client ID 設定並回到初始畫面嗎？")) {
+                if (window.confirm("確定重設?")) {
                     localStorage.removeItem('slide_ocr_config');
-                    setIsConfigured(false);
-                    setConfig({ clientId: '', apiKey: '' });
-                    setAccessToken(null);
-                    setUserProfile(null);
                     window.location.reload();
                 }
             };
 
             const handleLogin = () => {
-                if (envError) {
-                    alert("請先修正環境設定錯誤（請見上方紅框說明）。");
-                    return;
-                }
-                if (tokenClient) {
-                    tokenClient.requestAccessToken();
-                } else {
+                if (tokenClient) tokenClient.requestAccessToken();
+                else {
                     const client = initializeGoogle(config.clientId, config.apiKey);
-                    if (client) client.requestAccessToken();
+                    if(client) client.requestAccessToken();
                 }
             };
 
-            // --- File Processing (PDF/Images) ---
-
+            // --- File Upload ---
             const handleFileUpload = async (e) => {
                 const files = Array.from(e.target.files);
-                if (files.length === 0) return;
-
+                if (!files.length) return;
                 setIsProcessing(true);
-                setStatusMsg('正在處理檔案...');
-
                 let newSlides = [];
-
                 for (const file of files) {
                     if (file.type === 'application/pdf') {
-                        setStatusMsg(`正在解析 PDF: ${file.name}`);
-                        const pdfSlides = await processPDF(file);
-                        newSlides = [...newSlides, ...pdfSlides];
+                        const ab = await file.arrayBuffer();
+                        const pdf = await pdfjsLib.getDocument(ab).promise;
+                        for (let i = 1; i <= pdf.numPages; i++) {
+                            const page = await pdf.getPage(i);
+                            const vp = page.getViewport({ scale: 2.0 });
+                            const cvs = document.createElement('canvas');
+                            cvs.width = vp.width; cvs.height = vp.height;
+                            await page.render({ canvasContext: cvs.getContext('2d'), viewport: vp }).promise;
+                            newSlides.push({ id: crypto.randomUUID(), image: cvs.toDataURL('image/jpeg', 0.8), width: vp.width, height: vp.height, elements: [] });
+                        }
                     } else if (file.type.startsWith('image/')) {
-                        setStatusMsg(`正在處理圖片: ${file.name}`);
-                        const imgSlide = await processImage(file);
-                        newSlides.push(imgSlide);
+                        const reader = new FileReader();
+                        const imgData = await new Promise(r => { reader.onload = ev => r(ev.target.result); reader.readAsDataURL(file); });
+                        const img = new Image();
+                        await new Promise(r => { img.onload = r; img.src = imgData; });
+                        newSlides.push({ id: crypto.randomUUID(), image: imgData, width: img.width, height: img.height, elements: [] });
                     }
                 }
-
                 setSlides(prev => [...prev, ...newSlides]);
                 setIsProcessing(false);
-                setStatusMsg('');
             };
 
-            const processPDF = async (file) => {
-                const arrayBuffer = await file.arrayBuffer();
-                const pdf = await pdfjsLib.getDocument(arrayBuffer).promise;
-                const pages = [];
-
-                for (let i = 1; i <= pdf.numPages; i++) {
-                    const page = await pdf.getPage(i);
-                    // Use scale 2.0 for better quality, but we can display it scaled down
-                    const viewport = page.getViewport({ scale: 2.0 });
-                    const canvas = document.createElement('canvas');
-                    const context = canvas.getContext('2d');
-                    canvas.height = viewport.height;
-                    canvas.width = viewport.width;
-
-                    await page.render({ canvasContext: context, viewport: viewport }).promise;
-                    
-                    const imgData = canvas.toDataURL('image/jpeg', 0.8);
-                    pages.push({
-                        id: crypto.randomUUID(),
-                        image: imgData,
-                        width: viewport.width,
-                        height: viewport.height,
-                        elements: []
-                    });
-                }
-                return pages;
-            };
-
-            const processImage = (file) => {
-                return new Promise((resolve) => {
-                    const reader = new FileReader();
-                    reader.onload = (e) => {
-                        const img = new Image();
-                        img.onload = () => {
-                            resolve({
-                                id: crypto.randomUUID(),
-                                image: e.target.result,
-                                width: img.width,
-                                height: img.height,
-                                elements: []
-                            });
-                        };
-                        img.src = e.target.result;
-                    };
-                    reader.readAsDataURL(file);
-                });
-            };
-
-            // --- OCR Logic (Google Vision API) ---
-
+            // --- Advanced OCR & Text Removal ---
             const runOCR = async () => {
-                if (!slides.length) return;
-                if (!accessToken) {
-                    alert("請先登入 Google 帳號以使用 OCR 功能");
-                    handleLogin();
-                    return;
-                }
+                if (!slides.length || !accessToken) return alert("請先登入並上傳檔案");
+                const slide = slides[currentSlideIndex];
+                if (slide.elements.length && !confirm("重新識別將會重置此頁面，確定嗎？")) return;
                 
                 setIsProcessing(true);
-                const slide = slides[currentSlideIndex];
+                setStatusMsg('OCR 分析中...');
                 
-                if (slide.elements.length > 0) {
-                     if(!confirm("此頁面似乎已處理過，要重新識別嗎？")) {
-                         setIsProcessing(false);
-                         return;
-                     }
-                }
-
-                setStatusMsg('正在傳送至 Google Cloud Vision API...');
-
                 try {
-                    const base64Img = slide.image.split(',')[1];
-                    const url = `https://vision.googleapis.com/v1/images:annotate`;
-                    
-                    const response = await fetch(url, {
+                    // 1. Call Vision API
+                    const res = await fetch(`https://vision.googleapis.com/v1/images:annotate`, {
                         method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'Authorization': `Bearer ${accessToken}`
-                        },
-                        body: JSON.stringify({
-                            requests: [{
-                                image: { content: base64Img },
-                                features: [{ type: 'DOCUMENT_TEXT_DETECTION' }]
-                            }]
-                        })
+                        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${accessToken}` },
+                        body: JSON.stringify({ requests: [{ image: { content: slide.image.split(',')[1] }, features: [{ type: 'DOCUMENT_TEXT_DETECTION' }] }] })
                     });
+                    const result = await res.json();
+                    if (result.error) throw result.error;
 
-                    const result = await response.json();
+                    // 2. Prepare Canvas for Image Manipulation (Removing text)
+                    const tempCanvas = document.createElement('canvas');
+                    tempCanvas.width = slide.width;
+                    tempCanvas.height = slide.height;
+                    const ctx = tempCanvas.getContext('2d');
                     
-                    if (result.error) {
-                        throw result.error;
-                    }
-
-                    const annotation = result.responses?.[0]?.fullTextAnnotation;
-                    if (!annotation) {
-                        alert("未偵測到文字，或圖片解析度不足。");
-                        setIsProcessing(false);
-                        return;
-                    }
+                    // Load current image to canvas
+                    const img = new Image();
+                    await new Promise(r => { img.onload = r; img.src = slide.image; });
+                    ctx.drawImage(img, 0, 0);
 
                     const newElements = [];
+                    const annotation = result.responses?.[0]?.fullTextAnnotation;
                     
-                    annotation.pages[0].blocks.forEach(block => {
-                        block.paragraphs.forEach(para => {
-                            const vertices = para.boundingBox.vertices;
-                            const text = para.words.map(w => w.symbols.map(s => s.text).join('')).join(' ');
-                            
-                            const x = vertices[0].x || 0;
-                            const y = vertices[0].y || 0;
-                            const w = (vertices[2].x || x) - x;
-                            const h = (vertices[2].y || y) - y;
+                    if (annotation) {
+                        setStatusMsg('正在智慧去除原圖文字...');
+                        
+                        annotation.pages[0].blocks.forEach(block => {
+                            block.paragraphs.forEach(para => {
+                                const vertices = para.boundingBox.vertices;
+                                const text = para.words.map(w => w.symbols.map(s => s.text).join('')).join('');
+                                
+                                const x = vertices[0].x || 0;
+                                const y = vertices[0].y || 0;
+                                const w = (vertices[2].x || x) - x;
+                                const h = (vertices[2].y || y) - y;
 
-                            if (w > 0 && h > 0) {
-                                newElements.push({
-                                    id: crypto.randomUUID(),
-                                    text: text,
-                                    x: x,
-                                    y: y,
-                                    width: w,
-                                    height: h,
-                                    fontSize: Math.max(10, h * 0.75), // Tweak estimation to fit new tighter box
-                                    color: '#000000',
-                                    fontFamily: 'Arial',
-                                    backgroundColor: '#ffffff' // Default white background for "covering"
-                                });
-                            }
+                                if (w > 0 && h > 0) {
+                                    // A. 智慧取色 (Smart Background Sampling)
+                                    const bgColor = getDominantColor(ctx, x, y, w, h);
+                                    
+                                    // B. 去除原圖文字 (Erasure by filling with background color)
+                                    ctx.fillStyle = bgColor;
+                                    ctx.fillRect(x - 1, y - 1, w + 2, h + 2); // 稍微擴大一點覆蓋範圍
+
+                                    // C. 判斷直書 (Vertical Text Detection)
+                                    // 簡單規則：如果高度 > 寬度 * 1.5 且包含非 ASCII 字元(可能是中文)，假定為直書
+                                    const isVertical = (h > w * 1.5) && /[^\x00-\x7F]/.test(text);
+
+                                    newElements.push({
+                                        id: crypto.randomUUID(),
+                                        text: text,
+                                        x: x, y: y, width: w, height: h,
+                                        // 字體大小微調
+                                        fontSize: Math.round(isVertical ? w * 0.7 : h * 0.8),
+                                        color: '#000000',
+                                        fontFamily: 'Noto Sans TC',
+                                        backgroundColor: bgColor, // 雖然底圖已去背，但為了無縫融合，這裡也設定同色背景
+                                        isVertical: isVertical
+                                    });
+                                }
+                            });
                         });
-                    });
-
-                    const updatedSlides = [...slides];
-                    updatedSlides[currentSlideIndex].elements = newElements;
-                    setSlides(updatedSlides);
-
-                } catch (err) {
-                    console.error(err);
-                    let errMsg = err.message || JSON.stringify(err);
-                    
-                    if (errMsg.includes('has not been used in project') || errMsg.includes('disabled')) {
-                        alert(`【OCR 失敗】您的專案尚未啟用 Cloud Vision API。\n\n請前往 Google Cloud Console 啟用該 API。\n\n詳細錯誤：${errMsg}`);
-                        const urlMatch = errMsg.match(/https:\/\/console\.developers\.google\.com\/[^\s]+/);
-                        if (urlMatch) {
-                            window.open(urlMatch[0], '_blank');
-                        }
-                    } else if (errMsg.includes('billing')) {
-                        alert(`【需啟用結算帳戶】\n\nCloud Vision API (OCR) 需要專案連結結算帳戶才能使用（即使用量在免費額度內）。\n\n這通常是為了驗證身分。\n請前往 Google Cloud Console 啟用結算功能。\n\n詳細錯誤：${errMsg}`);
-                         const urlMatch = errMsg.match(/https:\/\/console\.developers\.google\.com\/[^\s]+/);
-                         if (urlMatch) {
-                             window.open(urlMatch[0], '_blank');
-                         }
-                    } else {
-                        alert("OCR 失敗: " + errMsg);
                     }
-                } finally {
-                    setIsProcessing(false);
-                    setStatusMsg('');
-                }
+                    
+                    // 3. Update Slide with "Cleaned" Image and New Elements
+                    const updated = [...slides];
+                    updated[currentSlideIndex].image = tempCanvas.toDataURL('image/jpeg', 0.9); // 更新為無字天書版底圖
+                    updated[currentSlideIndex].elements = newElements;
+                    setSlides(updated);
+
+                } catch (err) { alert("OCR 失敗: " + (err.message || JSON.stringify(err))); }
+                setIsProcessing(false); setStatusMsg('');
             };
 
-            // --- Editor Interactions ---
+            // --- Updates & Export ---
+            const updateElement = useCallback((id, changes) => {
+                setSlides(prev => {
+                    const newSlides = [...prev];
+                    const elements = newSlides[currentSlideIndex].elements;
+                    const idx = elements.findIndex(e => e.id === id);
+                    if (idx !== -1) {
+                        elements[idx] = { ...elements[idx], ...changes };
+                    }
+                    return newSlides;
+                });
+            }, [currentSlideIndex]);
 
-            const updateElement = (id, changes) => {
-                const updatedSlides = [...slides];
-                const elements = updatedSlides[currentSlideIndex].elements;
-                const elIndex = elements.findIndex(e => e.id === id);
-                if (elIndex !== -1) {
-                    elements[elIndex] = { ...elements[elIndex], ...changes };
-                    setSlides(updatedSlides);
-                }
+            const deleteElement = () => {
+                if (!selectedElementId) return;
+                setSlides(prev => {
+                    const newSlides = [...prev];
+                    newSlides[currentSlideIndex].elements = newSlides[currentSlideIndex].elements.filter(e => e.id !== selectedElementId);
+                    return newSlides;
+                });
+                setSelectedElementId(null);
             };
-
-            const handleTextChange = (id, newText) => {
-                updateElement(id, { text: newText });
-            };
-
-            // --- Export to Google Slides ---
 
             const exportToSlides = async () => {
-                if (!accessToken) {
-                    alert("請先登入 Google 帳號");
-                    handleLogin();
-                    return;
-                }
-                
-                setIsProcessing(true);
-                setStatusMsg('正在上傳圖片至 Google Drive...');
-
+                if (!accessToken) return alert("請先登入");
+                setIsProcessing(true); setStatusMsg('建立簡報中...');
                 try {
-                    // 1. Create Presentation
-                    setStatusMsg('建立簡報中...');
-                    
-                    const createRes = await gapi.client.request({
-                        path: 'https://slides.googleapis.com/v1/presentations',
-                        method: 'POST',
-                        body: { title: 'OCR Exported Presentation' }
-                    });
+                    const createRes = await gapi.client.request({ path: 'https://slides.googleapis.com/v1/presentations', method: 'POST', body: { title: 'OCR Export' } });
                     const presentationId = createRes.result.presentationId;
-
                     let requests = [];
-                    
+
                     for (let i = 0; i < slides.length; i++) {
-                        const slide = slides[i];
+                        const s = slides[i];
                         const pageId = `slide_${i}_${Date.now()}`;
-
-                        requests.push({
-                            createSlide: {
-                                objectId: pageId,
-                                slideLayoutReference: { predefinedLayout: 'BLANK' }
-                            }
-                        });
-
-                        setStatusMsg(`上傳第 ${i+1} 頁背景圖...`);
-                        const fileId = await uploadImageToDrive(slide.image);
+                        requests.push({ createSlide: { objectId: pageId, slideLayoutReference: { predefinedLayout: 'BLANK' } } });
                         
-                        requests.push({
-                            updatePageProperties: {
-                                objectId: pageId,
-                                pageProperties: {
-                                    pageBackgroundFill: {
-                                        stretchedPictureFill: {
-                                            contentUrl: `https://drive.google.com/uc?export=download&id=${fileId}`
-                                        }
-                                    }
-                                },
-                                fields: 'pageBackgroundFill'
-                            }
-                        });
+                        // Upload Cleaned BG
+                        const boundary = '-------314159265358979323846';
+                        const body = `\r\n--${boundary}\r\nContent-Type: application/json\r\n\r\n${JSON.stringify({name: 'bg.jpg', parents:['root']})}\r\n--${boundary}\r\nContent-Type: image/jpeg\r\nContent-Transfer-Encoding: base64\r\n\r\n${s.image.split(',')[1]}\r\n--${boundary}--`;
+                        const upRes = await gapi.client.request({ path: '/upload/drive/v3/files?uploadType=multipart', method: 'POST', headers: { 'Content-Type': `multipart/related; boundary="${boundary}"` }, body: body });
+                        const fileId = upRes.result.id;
+                        await gapi.client.request({ path: `/drive/v3/files/${fileId}/permissions`, method: 'POST', body: { role: 'reader', type: 'anyone' } });
 
-                        const scaleFactor = 0.75; 
-                        
-                        slide.elements.forEach(el => {
-                            const textBoxId = `text_${el.id}`;
-                            requests.push({
-                                createShape: {
-                                    objectId: textBoxId,
-                                    shapeType: 'TEXT_BOX',
-                                    elementProperties: {
-                                        pageObjectId: pageId,
-                                        size: {
-                                            width: { magnitude: el.width * scaleFactor, unit: 'PT' },
-                                            height: { magnitude: el.height * scaleFactor, unit: 'PT' }
-                                        },
-                                        transform: {
-                                            scaleX: 1, scaleY: 1,
-                                            translateX: el.x * scaleFactor,
-                                            translateY: el.y * scaleFactor,
-                                            unit: 'PT'
-                                        }
-                                    }
-                                }
-                            });
+                        requests.push({ updatePageProperties: { objectId: pageId, pageProperties: { pageBackgroundFill: { stretchedPictureFill: { contentUrl: `https://drive.google.com/uc?export=download&id=${fileId}` } } }, fields: 'pageBackgroundFill' } });
 
-                            requests.push({
-                                insertText: {
-                                    objectId: textBoxId,
-                                    text: el.text
-                                }
+                        // Add Text
+                        const pxToPt = 0.75;
+                        s.elements.forEach(el => {
+                            const id = `txt_${el.id}`;
+                            // 直書/橫書的 transform 稍微不同，但 Google Slides API 目前主要靠 Shape 內的文字設定
+                            // 這裡我們主要設定位置和大小
+                            requests.push({ 
+                                createShape: { 
+                                    objectId: id, 
+                                    shapeType: 'TEXT_BOX', 
+                                    elementProperties: { 
+                                        pageObjectId: pageId, 
+                                        size: { width: { magnitude: el.width * pxToPt, unit: 'PT' }, height: { magnitude: el.height * pxToPt, unit: 'PT' } }, 
+                                        transform: { scaleX: 1, scaleY: 1, translateX: el.x * pxToPt, translateY: el.y * pxToPt, unit: 'PT' } 
+                                    } 
+                                } 
                             });
+                            requests.push({ insertText: { objectId: id, text: el.text } });
                             
-                            requests.push({
-                                updateTextStyle: {
-                                    objectId: textBoxId,
-                                    style: {
-                                        fontSize: { magnitude: el.fontSize * scaleFactor, unit: 'PT' },
-                                        foregroundColor: {
-                                            opaqueColor: { rgbColor: hexToRgb(el.color) }
-                                        },
-                                        fontFamily: el.fontFamily
-                                    },
-                                    fields: 'fontSize,foregroundColor,fontFamily'
-                                }
+                            // Color Convert
+                            const hex = el.color;
+                            const r = parseInt(hex.slice(1,3),16)/255;
+                            const g = parseInt(hex.slice(3,5),16)/255;
+                            const b = parseInt(hex.slice(5,7),16)/255;
+
+                            // 如果是直書，這裡暫時沒有簡單的 API 可以直接設 writingMode，
+                            // 但我們可以先確保字型和顏色正確。Google Slides API 的 writingMode 設定較複雜。
+                            requests.push({ 
+                                updateTextStyle: { 
+                                    objectId: id, 
+                                    style: { 
+                                        fontSize: { magnitude: el.fontSize * pxToPt, unit: 'PT' }, 
+                                        foregroundColor: { opaqueColor: { rgbColor: { red: r, green: g, blue: b } } }, 
+                                        fontFamily: el.fontFamily 
+                                    }, 
+                                    fields: 'fontSize,foregroundColor,fontFamily' 
+                                } 
                             });
                         });
                     }
-
-                    setStatusMsg('正在寫入簡報內容...');
-                    await gapi.client.request({
-                        path: `https://slides.googleapis.com/v1/presentations/${presentationId}:batchUpdate`,
-                        method: 'POST',
-                        body: { requests: requests }
-                    });
-
-                    alert('簡報建立成功！已開啟新視窗。');
+                    await gapi.client.request({ path: `https://slides.googleapis.com/v1/presentations/${presentationId}:batchUpdate`, method: 'POST', body: { requests } });
                     window.open(`https://docs.google.com/presentation/d/${presentationId}/edit`, '_blank');
-
-                } catch (err) {
-                    console.error(err);
-                    let errMsg = err.result?.error?.message || err.message || JSON.stringify(err);
-                    
-                    if (errMsg.includes('has not been used in project') || errMsg.includes('disabled')) {
-                         alert(`【匯出失敗】您的專案尚未啟用 Drive 或 Slides API。\n\n請前往 Google Cloud Console 啟用 "Google Drive API" 和 "Google Slides API"。\n\n錯誤詳情：${errMsg}`);
-                         const urlMatch = errMsg.match(/https:\/\/console\.developers\.google\.com\/[^\s]+/);
-                         if (urlMatch) {
-                             window.open(urlMatch[0], '_blank');
-                         }
-                    } else {
-                         alert("匯出失敗: " + errMsg);
-                    }
-                } finally {
-                    setIsProcessing(false);
-                    setStatusMsg('');
-                }
+                } catch (e) { alert("匯出失敗: " + (e.result?.error?.message || e.message)); }
+                setIsProcessing(false); setStatusMsg('');
             };
-
-            const uploadImageToDrive = async (dataUrl) => {
-                const boundary = '-------314159265358979323846';
-                const delimiter = "\r\n--" + boundary + "\r\n";
-                const close_delim = "\r\n--" + boundary + "--";
-
-                const contentType = 'image/jpeg';
-                const metadata = {
-                    'name': 'ocr_slide_bg_' + Date.now() + '.jpg',
-                    'mimeType': contentType,
-                    'parents': ['root']
-                };
-
-                const base64Data = dataUrl.split(',')[1];
-                
-                const multipartRequestBody =
-                    delimiter +
-                    'Content-Type: application/json\r\n\r\n' +
-                    JSON.stringify(metadata) +
-                    delimiter +
-                    'Content-Type: ' + contentType + '\r\n' +
-                    'Content-Transfer-Encoding: base64\r\n' +
-                    '\r\n' +
-                    base64Data +
-                    close_delim;
-
-                const request = await gapi.client.request({
-                    'path': '/upload/drive/v3/files',
-                    'method': 'POST',
-                    'params': {'uploadType': 'multipart'},
-                    'headers': {
-                        'Content-Type': 'multipart/related; boundary="' + boundary + '"'
-                    },
-                    'body': multipartRequestBody
-                });
-                
-                const fileId = request.result.id;
-                
-                await gapi.client.request({
-                    path: `/drive/v3/files/${fileId}/permissions`,
-                    method: 'POST',
-                    body: {
-                        role: 'reader',
-                        type: 'anyone'
-                    }
-                });
-
-                return fileId;
-            };
-
-            const hexToRgb = (hex) => {
-                const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
-                return result ? {
-                    red: parseInt(result[1], 16) / 255,
-                    green: parseInt(result[2], 16) / 255,
-                    blue: parseInt(result[3], 16) / 255
-                } : { red: 0, green: 0, blue: 0 };
-            };
-
-            // --- Render Logic ---
 
             const currentSlide = slides[currentSlideIndex];
 
-            // Render Error or Config Screen
-            if (!isConfigured) {
-                return (
-                    <div className="min-h-screen flex items-center justify-center p-4">
-                        <div className="bg-white p-8 rounded shadow-lg max-w-md w-full">
-                            <h1 className="text-2xl font-bold mb-4 text-blue-600">設定 Google Cloud 專案</h1>
-                            
-                            {/* Environment Check Warning */}
-                            {envError === 'file_protocol' && (
-                                <div className="bg-red-50 border-l-4 border-red-500 p-4 mb-6">
-                                    <div className="flex">
-                                        <div className="flex-shrink-0"><i className="fas fa-exclamation-circle text-red-500"></i></div>
-                                        <div className="ml-3">
-                                            <p className="text-sm text-red-700 font-bold">檢測到錯誤的開啟方式</p>
-                                            <p className="text-sm text-red-600 mt-1">
-                                                您直接開啟了檔案 (file://)，Google 禁止這種方式登入。
-                                            </p>
-                                        </div>
-                                    </div>
-                                </div>
-                            )}
-
-                            {!envError && (
-                                <div className={`border-l-4 p-4 mb-6 ${isGithub ? 'bg-yellow-50 border-yellow-500' : 'bg-blue-50 border-blue-500'}`}>
-                                    <p className={`text-xs font-bold mb-1 ${isGithub ? 'text-yellow-800' : 'text-blue-800'}`}>
-                                        {isGithub ? '⚠️ GitHub Pages 設定提醒 (修復 403 錯誤)' : 'SETUP 重要步驟：設定授權來源'}
-                                    </p>
-                                    <p className={`text-xs mb-2 ${isGithub ? 'text-yellow-700' : 'text-blue-700'}`}>
-                                        {isGithub ? 
-                                            '偵測到您正在使用 GitHub Pages。請務必將下方網址加入 GCP Console 的「已授權的 JavaScript 來源」，否則會出現 403 錯誤。' : 
-                                            '請複製下方的網址，並貼到 GCP Console > 憑證 > OAuth 用戶端 ID > 已授權的 JavaScript 來源。'}
-                                    </p>
-                                    <div className="flex gap-2">
-                                        <code className="bg-white px-2 py-1 rounded border flex-1 text-xs overflow-x-auto">{currentOrigin}</code>
-                                        <button 
-                                            onClick={() => navigator.clipboard.writeText(currentOrigin).then(()=>alert("已複製網址！"))}
-                                            className="text-blue-600 hover:text-blue-800 text-xs px-2 py-1 border rounded bg-white"
-                                        >
-                                            複製
-                                        </button>
-                                    </div>
-                                </div>
-                            )}
-
-                            <p className="text-sm text-gray-600 mb-4">
-                                為了使用您的帳戶額度，請輸入 OAuth Client ID。<br/>
-                                <span className="text-red-500 font-bold">重要：</span>請確保您的專案已啟用 <strong>Cloud Vision API</strong> (用於OCR) 與 <strong>Drive/Slides API</strong>。
-                            </p>
-                            <form onSubmit={handleConfigSubmit}>
-                                <div className="mb-4">
-                                    <label className="block text-sm font-medium mb-1">Client ID (必要)</label>
-                                    <input required type="text" className="w-full border p-2 rounded" value={config.clientId} onChange={e => setConfig({...config, clientId: e.target.value})} placeholder="xxx.apps.googleusercontent.com" />
-                                </div>
-                                <div className="mb-4">
-                                    <label className="block text-sm font-medium mb-1">API Key (選填)</label>
-                                    <input type="text" className="w-full border p-2 rounded" value={config.apiKey} onChange={e => setConfig({...config, apiKey: e.target.value})} placeholder="AIzaSy... (若留空則使用 OAuth Token)" />
-                                    <p className="text-xs text-gray-500 mt-1">若留空，將使用登入後的 Token 進行 API 呼叫。</p>
-                                </div>
-                                
-                                <div className="mb-6 flex items-center">
-                                    <input 
-                                        type="checkbox" 
-                                        id="remember" 
-                                        checked={rememberConfig} 
-                                        onChange={e => setRememberConfig(e.target.checked)}
-                                        className="mr-2"
-                                    />
-                                    <label htmlFor="remember" className="text-sm text-gray-700">記住設定 (儲存於瀏覽器)</label>
-                                </div>
-
-                                <button type="submit" disabled={!!envError} className={`w-full text-white p-2 rounded font-bold shadow ${envError ? 'bg-gray-400 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700'}`}>
-                                    {envError ? '請先修正開啟方式' : '儲存設定並登入 Google'}
-                                </button>
-                            </form>
-                        </div>
+            if (!isConfigured) return (
+                <div className="min-h-screen flex items-center justify-center p-4">
+                    <div className="bg-white p-8 rounded shadow-lg max-w-md w-full">
+                        <h1 className="text-2xl font-bold mb-4 text-blue-600">設定 Google Cloud</h1>
+                        {envError && <div className="text-red-600 bg-red-50 p-3 rounded mb-4 text-sm font-bold">請勿直接開啟 HTML (file://)，請使用 Local Server。</div>}
+                        {!envError && <div className="bg-blue-50 p-3 rounded mb-4 text-xs text-blue-800">請將此網址加入 GCP Console 的「已授權來源」：<br/><code className="select-all bg-white p-1 rounded border">{currentOrigin}</code></div>}
+                        <form onSubmit={handleConfigSubmit}>
+                            <input required className="w-full border p-2 rounded mb-4" value={config.clientId} onChange={e=>setConfig({...config, clientId: e.target.value})} placeholder="Client ID" />
+                            <input className="w-full border p-2 rounded mb-4" value={config.apiKey} onChange={e=>setConfig({...config, apiKey: e.target.value})} placeholder="API Key (選填)" />
+                            <label className="flex items-center mb-6"><input type="checkbox" checked={rememberConfig} onChange={e=>setRememberConfig(e.target.checked)} className="mr-2"/> 記住設定</label>
+                            <button disabled={!!envError} className="w-full bg-blue-600 text-white p-2 rounded font-bold hover:bg-blue-700">儲存並登入</button>
+                        </form>
                     </div>
-                );
-            }
+                </div>
+            );
 
             return (
                 <div className="flex flex-col h-screen overflow-hidden">
-                    {/* Header */}
-                    <header className="bg-white border-b px-4 py-2 flex justify-between items-center shadow-sm z-10">
+                    <header className="bg-white border-b px-4 py-2 flex justify-between items-center z-20 shadow-sm">
+                        <div className="flex items-center gap-2 font-bold text-lg text-gray-700"><i className="fas fa-file-powerpoint text-yellow-500"></i> OCR Slide Editor</div>
                         <div className="flex items-center gap-3">
-                            <div className="text-yellow-500 text-2xl"><i className="fas fa-file-powerpoint"></i></div>
-                            <h1 className="text-lg font-semibold">Slide OCR Editor</h1>
-                        </div>
-                        
-                        <div className="flex gap-2 items-center">
-                            {isProcessing && <div className="loader w-5 h-5 border-2 mr-2"></div>}
-                            <span className="text-sm text-gray-600 mr-2">{statusMsg}</span>
-                            
-                            {!accessToken ? (
-                                <div className="flex items-center gap-2">
-                                    <button onClick={handleLogin} className="bg-blue-600 text-white px-4 py-1.5 rounded text-sm hover:bg-blue-700 shadow-sm">
-                                        <i className="fab fa-google mr-2"></i> 登入 Google
-                                    </button>
-                                    <button onClick={clearConfig} className="ml-2 text-gray-500 hover:text-red-600 text-sm flex items-center gap-1 px-2 py-1 rounded hover:bg-gray-100 transition-colors" title="清除 Client ID 並重新設定">
-                                        <i className="fas fa-trash-alt"></i> 清除 ID
-                                    </button>
-                                </div>
-                            ) : (
-                                <div className="flex items-center gap-2">
-                                    <span className="text-sm text-green-600 font-medium hidden sm:inline">已登入</span>
-                                    {userProfile && <img src={userProfile.picture} className="w-8 h-8 rounded-full border border-gray-300" title={userProfile.name} />}
-                                    <button onClick={exportToSlides} className="bg-yellow-500 text-white px-4 py-1.5 rounded text-sm hover:bg-yellow-600 shadow-sm">
-                                        <i className="fas fa-file-export mr-2"></i> 匯出
-                                    </button>
-                                    <button onClick={clearConfig} className="bg-gray-100 text-gray-600 border px-3 py-1.5 rounded text-sm hover:bg-red-50 hover:text-red-600 hover:border-red-200 transition-colors ml-2 shadow-sm" title="清除 ID 並登出">
-                                        <i className="fas fa-sign-out-alt mr-1"></i> 清除 ID
-                                    </button>
-                                </div>
-                            )}
+                            {isProcessing && <div className="loader w-5 h-5"></div>}
+                            <span className="text-sm text-gray-500">{statusMsg}</span>
+                            {!accessToken ? <button onClick={handleLogin} className="bg-blue-600 text-white px-3 py-1 rounded hover:bg-blue-700">登入</button> : 
+                            <div className="flex items-center gap-2">
+                                {userProfile && <img src={userProfile.picture} className="w-8 h-8 rounded-full border"/>}
+                                <button onClick={exportToSlides} className="bg-yellow-500 text-white px-3 py-1 rounded hover:bg-yellow-600 shadow-sm">匯出 PPT</button>
+                                <button onClick={clearConfig} className="text-gray-400 hover:text-red-500"><i className="fas fa-sign-out-alt"></i></button>
+                            </div>}
                         </div>
                     </header>
 
-                    {/* Toolbar */}
-                    <div className="bg-gray-50 border-b px-4 py-2 flex items-center gap-4 text-sm z-10 shadow-sm">
-                        <label className="cursor-pointer bg-white border px-3 py-1 rounded hover:bg-gray-50 shadow-sm flex items-center gap-2 transition-all">
-                            <i className="fas fa-upload text-gray-500"></i> 上傳 PDF/圖片
-                            <input type="file" multiple accept=".pdf,image/*" className="hidden" onChange={handleFileUpload} />
-                        </label>
-                        
-                        <div className="h-6 w-px bg-gray-300 mx-2"></div>
-
-                        <button onClick={runOCR} disabled={!currentSlide || isProcessing} className="bg-white border px-3 py-1 rounded hover:bg-gray-50 text-purple-700 disabled:opacity-50 transition-all shadow-sm">
-                            <i className="fas fa-magic mr-1"></i> 執行 OCR 轉換 (本頁)
-                        </button>
-
-                        <div className="flex items-center gap-2 ml-auto">
-                            <button onClick={() => setScale(s => Math.max(0.1, s - 0.1))} className="p-1.5 hover:bg-gray-200 rounded transition-colors"><i className="fas fa-minus"></i></button>
-                            <span className="w-12 text-center font-mono">{Math.round(scale * 100)}%</span>
-                            <button onClick={() => setScale(s => Math.min(3, s + 0.1))} className="p-1.5 hover:bg-gray-200 rounded transition-colors"><i className="fas fa-plus"></i></button>
+                    <div className="bg-white border-b px-4 py-2 flex items-center gap-4 text-sm shadow-sm z-10">
+                        <label className="cursor-pointer hover:bg-gray-100 px-2 py-1 rounded border"><i className="fas fa-upload mr-1"></i> 上傳<input type="file" multiple accept=".pdf,image/*" className="hidden" onChange={handleFileUpload} /></label>
+                        <button onClick={runOCR} disabled={!currentSlide || isProcessing} className="hover:bg-purple-50 text-purple-700 px-2 py-1 rounded border disabled:opacity-50"><i className="fas fa-magic mr-1"></i> OCR 智慧去字轉換</button>
+                        <div className="ml-auto flex items-center gap-2">
+                            <button onClick={() => setScale(s => Math.max(0.1, s - 0.1))} className="w-8 h-8 flex items-center justify-center hover:bg-gray-100 rounded">-</button>
+                            <span>{Math.round(scale * 100)}%</span>
+                            <button onClick={() => setScale(s => Math.min(3, s + 0.1))} className="w-8 h-8 flex items-center justify-center hover:bg-gray-100 rounded">+</button>
                         </div>
                     </div>
 
-                    <div className="flex flex-1 overflow-hidden">
-                        {/* Sidebar Thumbnails */}
-                        <div className="w-48 bg-gray-100 overflow-y-auto border-r flex flex-col p-2 gap-3 flex-shrink-0 z-10 shadow-inner">
+                    <div className="flex flex-1 overflow-hidden relative">
+                        {/* 左側縮圖 */}
+                        <div className="w-48 bg-gray-50 border-r flex-shrink-0 overflow-y-auto p-2 flex flex-col gap-2 z-10">
                             {slides.map((s, idx) => (
-                                <div 
-                                    key={s.id} 
-                                    onClick={() => setCurrentSlideIndex(idx)}
-                                    className={`slide-preview cursor-pointer bg-white p-2 border-2 rounded ${currentSlideIndex === idx ? 'active' : 'border-transparent'} shadow-sm`}
-                                >
-                                    <div className="relative aspect-video bg-gray-200 flex items-center justify-center overflow-hidden mb-1">
-                                        <img src={s.image} className="w-full h-full object-contain" />
-                                        <div className="absolute bottom-0 right-0 bg-black bg-opacity-50 text-white text-xs px-1">
-                                            {idx + 1}
-                                        </div>
-                                    </div>
+                                <div key={s.id} onClick={() => setCurrentSlideIndex(idx)} className={`slide-preview cursor-pointer bg-white border-2 rounded p-1 ${currentSlideIndex === idx ? 'active' : 'border-transparent'}`}>
+                                    <img src={s.image} className="w-full h-auto object-contain" />
+                                    <div className="text-center text-xs text-gray-500 mt-1">{idx + 1}</div>
                                 </div>
                             ))}
-                            {slides.length === 0 && <div className="text-gray-400 text-center mt-10 text-sm">尚無頁面<br/>請先上傳</div>}
                         </div>
 
-                        {/* Main Editor Area - Centered Layout */}
-                        <div 
-                            className="flex-1 bg-gray-200 overflow-auto flex justify-center items-start p-10" 
-                            id="canvas-container"
-                            ref={canvasContainerRef}
-                        >
+                        {/* 主編輯區 */}
+                        <div className="flex-1 bg-gray-200 overflow-auto flex justify-center p-10" ref={canvasContainerRef}>
                             {currentSlide ? (
-                                <div
-                                    style={{
-                                        // Outer wrapper size handles the physical space in the flex container
-                                        width: currentSlide.width * scale,
-                                        height: currentSlide.height * scale,
-                                        flexShrink: 0 // Prevent shrinking
-                                    }}
-                                >
-                                    <div 
-                                        className="editor-canvas shadow-lg"
-                                        style={{
-                                            // Inner canvas stays at original resolution but scales visually
-                                            width: currentSlide.width,
-                                            height: currentSlide.height,
-                                            transform: `scale(${scale})`,
-                                            transformOrigin: 'top left'
-                                        }}
-                                    >
-                                        {/* Original Image Background */}
-                                        <img src={currentSlide.image} className="absolute inset-0 w-full h-full pointer-events-none select-none" />
-
-                                        {/* Editable Text Overlays */}
+                                <div style={{ width: currentSlide.width * scale, height: currentSlide.height * scale, flexShrink: 0 }}>
+                                    <div className="editor-canvas" style={{ width: currentSlide.width, height: currentSlide.height, transform: `scale(${scale})`, transformOrigin: 'top left' }}>
+                                        <img src={currentSlide.image} className="absolute inset-0 w-full h-full pointer-events-none" />
                                         {currentSlide.elements.map(el => (
-                                            <div
-                                                key={el.id}
-                                                className="editable-box"
-                                                contentEditable
-                                                suppressContentEditableWarning
-                                                style={{
-                                                    left: `${el.x}px`,
-                                                    top: `${el.y}px`,
-                                                    width: `${el.width}px`,
-                                                    height: `${el.height}px`,
-                                                    fontSize: `${el.fontSize}px`,
-                                                    color: el.color,
-                                                    fontFamily: el.fontFamily,
-                                                    backgroundColor: el.backgroundColor || '#ffffff' // Default white
-                                                }}
-                                                onInput={(e) => handleTextChange(el.id, e.target.innerText)}
-                                                onFocus={() => setSelectedElementId(el.id)}
-                                                onBlur={() => setSelectedElementId(null)}
-                                            >
-                                                {el.text}
-                                            </div>
+                                            <EditableBlock 
+                                                key={el.id} 
+                                                el={el} 
+                                                isSelected={selectedElementId === el.id} 
+                                                onSelect={setSelectedElementId} 
+                                                onUpdate={updateElement} 
+                                            />
                                         ))}
                                     </div>
                                 </div>
-                            ) : (
-                                <div className="flex flex-col items-center justify-center text-gray-400 mt-20">
-                                    <i className="fas fa-image text-6xl mb-4"></i>
-                                    <p>請上傳檔案以開始編輯</p>
-                                </div>
-                            )}
+                            ) : <div className="m-auto text-gray-400 text-center"><i className="fas fa-image text-4xl mb-2"></i><br/>請上傳文件</div>}
                         </div>
-                        
-                        {/* Right Property Panel (Visible when text selected) */}
+
+                        {/* 懸浮屬性面板 */}
                         {selectedElementId && (
-                            <div className="w-64 bg-white border-l p-4 shadow-xl z-20 flex-shrink-0">
-                                <h3 className="font-bold text-gray-700 mb-4 border-b pb-2">文字屬性</h3>
+                            <div className="property-panel p-4 flex flex-col gap-3" onMouseDown={e => e.stopPropagation()}>
+                                <div className="flex justify-between items-center border-b pb-2 mb-1">
+                                    <h3 className="font-bold text-gray-700">文字樣式</h3>
+                                    <button onClick={deleteElement} className="text-red-500 hover:bg-red-50 px-2 py-1 rounded text-xs"><i className="fas fa-trash-alt"></i> 刪除</button>
+                                </div>
                                 {(() => {
                                     const el = currentSlide.elements.find(e => e.id === selectedElementId);
                                     if (!el) return null;
                                     return (
-                                        <div className="space-y-4">
-                                            <div>
-                                                <label className="block text-xs font-bold text-gray-500 mb-1">字型大小</label>
-                                                <input 
-                                                    type="number" 
-                                                    value={Math.round(el.fontSize)} 
-                                                    onChange={(e) => updateElement(el.id, { fontSize: parseInt(e.target.value) })}
-                                                    className="w-full border p-1 rounded"
-                                                />
-                                            </div>
-                                            <div>
-                                                <label className="block text-xs font-bold text-gray-500 mb-1">文字顏色</label>
-                                                <input 
-                                                    type="color" 
-                                                    value={el.color} 
-                                                    onChange={(e) => updateElement(el.id, { color: e.target.value })}
-                                                    className="w-full h-8 cursor-pointer"
-                                                />
-                                            </div>
-                                            <div>
-                                                <label className="block text-xs font-bold text-gray-500 mb-1">背景顏色 (遮蓋用)</label>
-                                                <div className="flex items-center gap-2">
-                                                    <input 
-                                                        type="color" 
-                                                        value={el.backgroundColor || '#ffffff'} 
-                                                        onChange={(e) => updateElement(el.id, { backgroundColor: e.target.value })}
-                                                        className="w-8 h-8 cursor-pointer border rounded"
-                                                    />
-                                                    <button 
-                                                        onClick={() => updateElement(el.id, { backgroundColor: 'transparent' })}
-                                                        className="text-xs bg-gray-100 px-2 py-1 rounded hover:bg-gray-200"
-                                                    >
-                                                        透明
-                                                    </button>
+                                        <>
+                                            <div className="grid grid-cols-2 gap-2">
+                                                <div>
+                                                    <label className="text-xs text-gray-500">字型大小</label>
+                                                    <input type="number" value={Math.round(el.fontSize)} onChange={(e) => updateElement(el.id, { fontSize: parseInt(e.target.value) })} className="w-full border rounded p-1" />
+                                                </div>
+                                                <div>
+                                                    <label className="text-xs text-gray-500">顏色</label>
+                                                    <input type="color" value={el.color} onChange={(e) => updateElement(el.id, { color: e.target.value })} className="w-full h-8 cursor-pointer border rounded" />
                                                 </div>
                                             </div>
                                             <div>
-                                                <label className="block text-xs font-bold text-gray-500 mb-1">字型</label>
-                                                <select 
-                                                    value={el.fontFamily}
-                                                    onChange={(e) => updateElement(el.id, { fontFamily: e.target.value })}
-                                                    className="w-full border p-1 rounded"
-                                                >
+                                                <label className="text-xs text-gray-500 block mb-1">背景色</label>
+                                                <div className="flex gap-2">
+                                                    <input type="color" value={el.backgroundColor || '#ffffff'} onChange={(e) => updateElement(el.id, { backgroundColor: e.target.value })} className="flex-1 h-8 cursor-pointer border rounded" />
+                                                    <button onClick={() => updateElement(el.id, { backgroundColor: 'transparent' })} className="text-xs bg-gray-100 px-2 rounded border">透明</button>
+                                                </div>
+                                            </div>
+                                            <div className="flex items-center gap-2 mt-1">
+                                                <input type="checkbox" checked={el.isVertical || false} onChange={(e) => updateElement(el.id, { isVertical: e.target.checked })} />
+                                                <label className="text-xs text-gray-700">直書模式 (Vertical)</label>
+                                            </div>
+                                            <div>
+                                                <label className="text-xs text-gray-500">字型</label>
+                                                <select value={el.fontFamily} onChange={(e) => updateElement(el.id, { fontFamily: e.target.value })} className="w-full border rounded p-1 text-sm">
+                                                    <option value="Noto Sans TC">Noto Sans TC</option>
                                                     <option value="Arial">Arial</option>
                                                     <option value="Times New Roman">Times New Roman</option>
-                                                    <option value="Courier New">Courier New</option>
-                                                    <option value="Roboto">Roboto</option>
-                                                    <option value="Noto Sans TC">Noto Sans TC</option>
+                                                    <option value="Microsoft JhengHei">微軟正黑體</option>
                                                 </select>
                                             </div>
-                                        </div>
+                                        </>
                                     );
                                 })()}
                             </div>
