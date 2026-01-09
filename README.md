@@ -1,0 +1,2 @@
+# GeminiSlideEditor
+Gemini Slide Editor
