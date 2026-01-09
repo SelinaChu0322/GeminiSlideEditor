@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>智慧 PDF/OCR 簡報編輯器 (Inpainting Mode)</title>
+    <title>智慧 PDF/OCR 簡報編輯器 (Hybrid Clean Mode)</title>
     
     <!-- React & ReactDOM -->
     <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
@@ -89,6 +89,44 @@
             to { opacity: 1; transform: translateX(0); }
         }
         
+        /* 便利貼樣式 */
+        .sticky-note {
+            background-color: #fef3c7; /* yellow-100 */
+            border-left: 4px solid #f59e0b; /* yellow-500 */
+            padding: 1rem;
+            position: relative;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+            border-radius: 0.375rem;
+            font-size: 0.875rem;
+            color: #78350f; /* yellow-900 */
+            max-width: 320px;
+            animation: fadeIn 0.5s ease-out;
+        }
+        
+        .sticky-note .close-btn {
+            position: absolute;
+            top: 0.5rem;
+            right: 0.5rem;
+            color: #92400e;
+            cursor: pointer;
+            opacity: 0.6;
+        }
+        .sticky-note .close-btn:hover { opacity: 1; }
+
+        .help-btn {
+            cursor: pointer;
+            color: #3b82f6;
+            margin-left: 6px;
+            font-size: 0.9em;
+            transition: color 0.2s;
+        }
+        .help-btn:hover { color: #2563eb; }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
         .loader {
             border: 4px solid #f3f3f3;
             border-top: 4px solid #3498db;
@@ -108,68 +146,106 @@
 
         const SCOPES = 'https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/presentations https://www.googleapis.com/auth/cloud-vision';
 
-        // --- 進階演算法: 雙線性插值修復 (Inpainting) ---
-        // 這是模擬「浮水印去除」的關鍵函式
+        // --- 優化版演算法: 混合填色修復 (Hybrid Inpainting) ---
+        // 自動判斷區域是「純色」還是「漸層」，選擇最佳填補方式
         const smartInpaint = (ctx, x, y, w, h) => {
             try {
-                // 向外擴展 2px 取樣背景
-                const margin = 2;
+                const margin = 2; // 取樣範圍
                 const sx = Math.max(0, Math.floor(x - margin));
                 const sy = Math.max(0, Math.floor(y - margin));
                 const sw = Math.ceil(w + margin * 2);
                 const sh = Math.ceil(h + margin * 2);
 
-                // 取得該區域的像素資料
                 const imgData = ctx.getImageData(sx, sy, sw, sh);
                 const data = imgData.data;
                 const width = sw;
                 const height = sh;
 
-                // 針對區域內的每一個像素進行修補
-                for (let j = 0; j < height; j++) {
-                    for (let i = 0; i < width; i++) {
-                        // 只處理「內部」的像素 (即原本文字所在的位置)
-                        // 邊緣像素保持原樣，作為取樣來源
-                        if (i > margin && i < width - margin && j > margin && j < height - margin) {
-                            
+                // 1. 分析邊界顏色變異數 (Variance)
+                let rSum = 0, gSum = 0, bSum = 0;
+                let count = 0;
+                const borderPixels = [];
+
+                // 收集邊界像素
+                const addPixel = (idx) => {
+                    const r = data[idx], g = data[idx+1], b = data[idx+2];
+                    rSum += r; gSum += g; bSum += b;
+                    borderPixels.push({r, g, b});
+                    count++;
+                };
+
+                for (let i = 0; i < width; i++) {
+                    addPixel((0 * width + i) * 4); // Top
+                    addPixel(((height - 1) * width + i) * 4); // Bottom
+                }
+                for (let j = 1; j < height - 1; j++) {
+                    addPixel((j * width + 0) * 4); // Left
+                    addPixel((j * width + (width - 1)) * 4); // Right
+                }
+
+                const rAvg = rSum / count;
+                const gAvg = gSum / count;
+                const bAvg = bSum / count;
+
+                // 計算標準差
+                let variance = 0;
+                borderPixels.forEach(p => {
+                    variance += Math.pow(p.r - rAvg, 2) + Math.pow(p.g - gAvg, 2) + Math.pow(p.b - bAvg, 2);
+                });
+                variance /= count;
+                const stdDev = Math.sqrt(variance);
+
+                // 2. 決策：如果是低變異 (純色背景)，直接填平均色；如果是高變異，用插值
+                const THRESHOLD = 30; // 閾值，可調整
+                
+                if (stdDev < THRESHOLD) {
+                    // --- 模式 A: 純色填滿 (Solid Fill) ---
+                    // 這對於白底黑字的文件效果最好，不會有模糊感
+                    for (let j = margin; j < height - margin; j++) {
+                        for (let i = margin; i < width - margin; i++) {
+                            const index = (j * width + i) * 4;
+                            data[index] = rAvg;
+                            data[index+1] = gAvg;
+                            data[index+2] = bAvg;
+                            data[index+3] = 255;
+                        }
+                    }
+                } else {
+                    // --- 模式 B: 雙線性插值 (Bilinear Interpolation) ---
+                    // 適合漸層背景或複雜圖案
+                    for (let j = margin; j < height - margin; j++) {
+                        for (let i = margin; i < width - margin; i++) {
                             const index = (j * width + i) * 4;
                             
-                            // 取得上下左右四個邊界對應點的像素索引
                             const topIdx = (0 * width + i) * 4;
                             const bottomIdx = ((height - 1) * width + i) * 4;
                             const leftIdx = (j * width + 0) * 4;
                             const rightIdx = (j * width + (width - 1)) * 4;
 
-                            // 計算權重 (線性插值)
                             const yRatio = j / height;
                             const xRatio = i / width;
 
-                            // R 通道混合
-                            const rH = data[topIdx] * (1 - yRatio) + data[bottomIdx] * yRatio; // 垂直方向的漸層預測
-                            const rV = data[leftIdx] * (1 - xRatio) + data[rightIdx] * xRatio; // 水平方向的漸層預測
-                            data[index] = (rH + rV) / 2; // 取平均
+                            // 混合權重計算
+                            const rH = data[topIdx] * (1 - yRatio) + data[bottomIdx] * yRatio;
+                            const rV = data[leftIdx] * (1 - xRatio) + data[rightIdx] * xRatio;
+                            data[index] = (rH + rV) / 2;
 
-                            // G 通道混合
                             const gH = data[topIdx+1] * (1 - yRatio) + data[bottomIdx+1] * yRatio;
                             const gV = data[leftIdx+1] * (1 - xRatio) + data[rightIdx+1] * xRatio;
                             data[index+1] = (gH + gV) / 2;
 
-                            // B 通道混合
                             const bH = data[topIdx+2] * (1 - yRatio) + data[bottomIdx+2] * yRatio;
                             const bV = data[leftIdx+2] * (1 - xRatio) + data[rightIdx+2] * xRatio;
                             data[index+2] = (bH + bV) / 2;
 
-                            // Alpha 通道 (不透明)
-                            data[index+3] = 255; 
+                            data[index+3] = 255;
                         }
                     }
                 }
                 
-                // 將修復後的像素放回畫布
                 ctx.putImageData(imgData, sx, sy);
             } catch (e) {
                 console.error("Inpainting failed", e);
-                // Fallback: 簡單填白
                 ctx.fillStyle = '#ffffff';
                 ctx.fillRect(x, y, w, h);
             }
@@ -221,6 +297,17 @@
             );
         });
 
+        // --- 便利貼元件 ---
+        const HelpNote = ({ title, onClose, children }) => (
+            <div className="sticky-note mb-4">
+                <div className="close-btn" onClick={onClose}><i className="fas fa-times"></i></div>
+                <h4 className="font-bold mb-2 text-amber-800 border-b border-amber-300 pb-1">{title}</h4>
+                <div className="space-y-1">
+                    {children}
+                </div>
+            </div>
+        );
+
         function App() {
             const [config, setConfig] = useState({ clientId: '', apiKey: '' });
             const [rememberConfig, setRememberConfig] = useState(true);
@@ -231,6 +318,12 @@
             const [envError, setEnvError] = useState(null);
             const [currentOrigin, setCurrentOrigin] = useState('');
             const [isGithub, setIsGithub] = useState(false);
+            
+            // UI State
+            const [showIdHelp, setShowIdHelp] = useState(true);
+            const [showOriginHelp, setShowOriginHelp] = useState(true);
+
+            // Editor
             const [slides, setSlides] = useState([]);
             const [currentSlideIndex, setCurrentSlideIndex] = useState(0);
             const [scale, setScale] = useState(0.5);
@@ -246,6 +339,7 @@
                 if (protocol === 'file:') setEnvError('file_protocol');
                 if (window.location.hostname.endsWith('github.io')) setIsGithub(true);
 
+                // 1. 恢復 Client ID 設定
                 const savedConfig = localStorage.getItem('slide_ocr_config');
                 if (savedConfig) {
                     try {
@@ -256,6 +350,34 @@
                             initializeGoogle(parsed.clientId, parsed.apiKey);
                         }
                     } catch (e) { console.error(e); }
+                }
+
+                // 2. 恢復登入狀態 (檢查 Token 有效性)
+                const savedAuth = localStorage.getItem('slide_ocr_auth');
+                if (savedAuth) {
+                    try {
+                        const authData = JSON.parse(savedAuth);
+                        if (authData.token && authData.expiry > Date.now() + 300000) {
+                            console.log("Restoring active session...");
+                            setAccessToken(authData.token);
+                            fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+                                headers: { Authorization: `Bearer ${authData.token}` }
+                            }).then(res => {
+                                if (!res.ok) throw new Error('Token expired');
+                                return res.json();
+                            }).then(data => {
+                                setUserProfile(data);
+                            }).catch(err => {
+                                console.warn("Session restore failed", err);
+                                setAccessToken(null);
+                                localStorage.removeItem('slide_ocr_auth');
+                            });
+                        } else {
+                            localStorage.removeItem('slide_ocr_auth');
+                        }
+                    } catch (e) {
+                        localStorage.removeItem('slide_ocr_auth');
+                    }
                 }
 
                 const handleGlobalClick = (e) => {
@@ -274,6 +396,13 @@
                         callback: (tokenResponse) => {
                             if (tokenResponse.access_token) {
                                 setAccessToken(tokenResponse.access_token);
+                                
+                                const expiryTime = Date.now() + (tokenResponse.expires_in * 1000);
+                                localStorage.setItem('slide_ocr_auth', JSON.stringify({
+                                    token: tokenResponse.access_token,
+                                    expiry: expiryTime
+                                }));
+
                                 fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
                                     headers: { Authorization: `Bearer ${tokenResponse.access_token}` }
                                 }).then(res => res.json()).then(data => setUserProfile(data));
@@ -297,13 +426,20 @@
                     if (rememberConfig) localStorage.setItem('slide_ocr_config', JSON.stringify(config));
                     else localStorage.removeItem('slide_ocr_config');
                     setIsConfigured(true);
-                    setTimeout(() => initializeGoogle(config.clientId, config.apiKey), 500);
+                    
+                    setTimeout(() => {
+                        const client = initializeGoogle(config.clientId, config.apiKey);
+                        if (client && !accessToken) {
+                            client.requestAccessToken();
+                        }
+                    }, 500);
                 }
             };
 
             const clearConfig = () => {
-                if (window.confirm("確定重設?")) {
+                if (window.confirm("確定重設? 這將清除登入狀態與 Client ID。")) {
                     localStorage.removeItem('slide_ocr_config');
+                    localStorage.removeItem('slide_ocr_auth');
                     window.location.reload();
                 }
             };
@@ -374,7 +510,7 @@
                     const annotation = result.responses?.[0]?.fullTextAnnotation;
                     
                     if (annotation) {
-                        setStatusMsg('正在執行浮水印去除與文字填補...');
+                        setStatusMsg('正在執行智慧去背與文字填補...');
                         
                         annotation.pages[0].blocks.forEach(block => {
                             block.paragraphs.forEach(para => {
@@ -387,8 +523,6 @@
                                 const h = (vertices[2].y || y) - y;
 
                                 if (w > 0 && h > 0) {
-                                    // 1. 執行 Inpainting (浮水印去除)
-                                    // 這會直接修改底圖，把文字「擦掉」
                                     smartInpaint(ctx, x, y, w, h);
 
                                     const isVertical = (h > w * 1.5) && /[^\x00-\x7F]/.test(text);
@@ -400,7 +534,6 @@
                                         fontSize: Math.round(isVertical ? w * 0.7 : h * 0.8),
                                         color: '#000000',
                                         fontFamily: 'Noto Sans TC',
-                                        // 2. 文字框背景設為透明 (因為底圖已經擦乾淨了)
                                         backgroundColor: 'transparent',
                                         isVertical: isVertical
                                     });
@@ -410,7 +543,6 @@
                     }
                     
                     const updated = [...slides];
-                    // 更新為「去背後」的圖片
                     updated[currentSlideIndex].image = tempCanvas.toDataURL('image/jpeg', 0.9);
                     updated[currentSlideIndex].elements = newElements;
                     setSlides(updated);
@@ -505,17 +637,64 @@
             const currentSlide = slides[currentSlideIndex];
 
             if (!isConfigured) return (
-                <div className="min-h-screen flex items-center justify-center p-4">
-                    <div className="bg-white p-8 rounded shadow-lg max-w-md w-full">
+                <div className="min-h-screen flex flex-col md:flex-row items-center justify-center p-4 gap-8">
+                    {/* 左側：設定/登入表單 */}
+                    <div className="bg-white p-8 rounded shadow-lg max-w-md w-full flex-shrink-0">
                         <h1 className="text-2xl font-bold mb-4 text-blue-600">設定 Google Cloud</h1>
                         {envError && <div className="text-red-600 bg-red-50 p-3 rounded mb-4 text-sm font-bold">請勿直接開啟 HTML (file://)，請使用 Local Server。</div>}
-                        {!envError && <div className="bg-blue-50 p-3 rounded mb-4 text-xs text-blue-800">請將此網址加入 GCP Console 的「已授權來源」：<br/><code className="select-all bg-white p-1 rounded border">{currentOrigin}</code></div>}
+                        {!envError && <div className="bg-blue-50 p-3 rounded mb-4 text-xs text-blue-800 flex justify-between items-start">
+                            <div className="flex-1 mr-2">
+                                請將此網址加入 GCP Console 的「已授權來源」：<br/>
+                                <div className="flex items-center gap-1 mt-1">
+                                    <code className="select-all bg-white p-1 rounded border break-all flex-1">{currentOrigin}</code>
+                                    <button 
+                                        onClick={() => navigator.clipboard.writeText(currentOrigin).then(()=>alert("已複製網址！"))} 
+                                        className="text-blue-600 hover:text-blue-800 bg-white border px-2 py-1 rounded hover:bg-gray-50 transition-colors"
+                                        title="複製網址"
+                                    >
+                                        <i className="far fa-copy"></i>
+                                    </button>
+                                </div>
+                            </div>
+                            <i className="fas fa-question-circle help-btn mt-1" onClick={() => setShowOriginHelp(true)} title="顯示說明"></i>
+                        </div>}
                         <form onSubmit={handleConfigSubmit}>
-                            <input required className="w-full border p-2 rounded mb-4" value={config.clientId} onChange={e=>setConfig({...config, clientId: e.target.value})} placeholder="Client ID" />
+                            <div className="mb-4">
+                                <label className="block text-sm font-medium text-gray-700 mb-1 flex items-center">
+                                    Client ID (必要)
+                                    <i className="fas fa-question-circle help-btn" onClick={() => setShowIdHelp(true)} title="如何取得?"></i>
+                                </label>
+                                <input required className="w-full border p-2 rounded" value={config.clientId} onChange={e=>setConfig({...config, clientId: e.target.value})} placeholder="xxx.apps.googleusercontent.com" />
+                            </div>
                             <input className="w-full border p-2 rounded mb-4" value={config.apiKey} onChange={e=>setConfig({...config, apiKey: e.target.value})} placeholder="API Key (選填)" />
                             <label className="flex items-center mb-6"><input type="checkbox" checked={rememberConfig} onChange={e=>setRememberConfig(e.target.checked)} className="mr-2"/> 記住設定</label>
-                            <button disabled={!!envError} className="w-full bg-blue-600 text-white p-2 rounded font-bold hover:bg-blue-700">儲存並登入</button>
+                            <button disabled={!!envError} className="w-full bg-blue-600 text-white p-2 rounded font-bold hover:bg-blue-700 shadow flex items-center justify-center gap-2">
+                                <span>儲存並登入 Google</span>
+                                <i className="fab fa-google"></i>
+                            </button>
                         </form>
+                    </div>
+
+                    {/* 右側：教學便利貼區塊 */}
+                    <div className="flex flex-col gap-4 max-w-sm w-full">
+                        {showIdHelp && (
+                            <HelpNote title="🔍 如何查詢 Google Client ID?" onClose={() => setShowIdHelp(false)}>
+                                <p>1. 進入 <a href="https://console.cloud.google.com/apis/credentials" target="_blank" className="text-blue-600 underline">GCP 憑證頁面</a>。</p>
+                                <p>2. 點擊「+ 建立憑證」選擇「OAuth 用戶端 ID」。</p>
+                                <p>3. 應用程式類型選「網頁應用程式」。</p>
+                                <p>4. 建立後，點選用戶端ID的複製鍵貼入 (<code>.apps.googleusercontent.com</code> 結尾的文字)。</p>
+                            </HelpNote>
+                        )}
+                        
+                        {showOriginHelp && (
+                            <HelpNote title="⚠️ 遇到 403 錯誤 / 授權失敗?" onClose={() => setShowOriginHelp(false)}>
+                                <p>1. 在 GCP 憑證頁面，點擊您的 Client ID 編輯按鈕 (<svg className="inline-block w-3 h-3 text-gray-600 mb-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"></path></svg>)。</p>
+                                <p>2. 找到 <strong>「已授權的 JavaScript 來源」</strong>。</p>
+                                <p>3. 點擊「新增 URI」。</p>
+                                <p>4. 點選左側藍色框框內的複製按鈕，並貼上網址。</p>
+                                <p>5. <strong>儲存</strong> (需等待約 5 分鐘生效)。</p>
+                            </HelpNote>
+                        )}
                     </div>
                 </div>
             );
@@ -529,9 +708,9 @@
                             <span className="text-sm text-gray-500">{statusMsg}</span>
                             {!accessToken ? <button onClick={handleLogin} className="bg-blue-600 text-white px-3 py-1 rounded hover:bg-blue-700">登入</button> : 
                             <div className="flex items-center gap-2">
-                                {userProfile && <img src={userProfile.picture} className="w-8 h-8 rounded-full border"/>}
+                                {userProfile && <img src={userProfile.picture} className="w-8 h-8 rounded-full border" title={`已登入: ${userProfile.name}`}/>}
                                 <button onClick={exportToSlides} className="bg-yellow-500 text-white px-3 py-1 rounded hover:bg-yellow-600 shadow-sm">匯出 PPT</button>
-                                <button onClick={clearConfig} className="text-gray-400 hover:text-red-500"><i className="fas fa-sign-out-alt"></i></button>
+                                <button onClick={clearConfig} className="text-gray-400 hover:text-red-500" title="登出並重設"><i className="fas fa-sign-out-alt"></i></button>
                             </div>}
                         </div>
                     </header>
